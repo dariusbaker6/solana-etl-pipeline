@@ -46,10 +46,3 @@
 
 ![etl_diagram](https://github.com/user-attachments/assets/a914d5bb-ba4c-4cc9-8065-2f4e8842de36)
 
-
----
-
-## 🛑 Security Notice
-
-All API keys and credentials are redacted. Ensure proper use of `.env` and `.gitignore` in your deployment.
-# solana-etl-pipeline

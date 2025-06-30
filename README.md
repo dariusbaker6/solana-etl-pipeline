@@ -44,7 +44,8 @@
 
 ## 🔍 Architecture Diagram
 
-![ETL Diagram](etl_diagram.png)
+![etl_diagram](https://github.com/user-attachments/assets/a914d5bb-ba4c-4cc9-8065-2f4e8842de36)
+
 
 ---
 

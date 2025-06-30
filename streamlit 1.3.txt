@@ -1,0 +1,185 @@
+import streamlit as st
+import pandas as pd
+import boto3
+import io
+import time
+import aiohttp
+import asyncio
+import concurrent.futures
+import os
+
+# AWS S3 Config
+S3_BUCKET = "aws-glue-assets-257394459861-us-west-2"
+S3_PATH = "Helius-Databrew/parquet/"
+s3_client = boto3.client("s3")
+
+# Excluded Addresses
+EXCLUDED_ADDRESSES = {
+    "So11111111111111111111111111111111111111112",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+}
+
+# Dynamically Scale Threads
+MAX_WORKERS = min(10, os.cpu_count() * 2)
+
+def get_latest_file_info():
+    paginator = s3_client.get_paginator("list_objects_v2")
+    pages = paginator.paginate(Bucket=S3_BUCKET, Prefix=S3_PATH)
+
+    latest_file = None
+    latest_timestamp = 0
+
+    for page in pages:
+        for obj in page.get("Contents", []):
+            mod_time = obj["LastModified"].timestamp()
+            if mod_time > latest_timestamp:
+                latest_timestamp = mod_time
+                latest_file = obj["Key"]
+    return latest_file, latest_timestamp
+
+@st.cache_data(ttl=300)
+def load_parquet_from_s3(latest_file, latest_timestamp):
+    if not latest_file:
+        st.error("No Parquet files found in S3 bucket.")
+        return None
+
+    response = s3_client.get_object(Bucket=S3_BUCKET, Key=latest_file)
+    file_stream = io.BytesIO(response["Body"].read())
+    df = pd.read_parquet(file_stream).tail(100000)
+
+    df["Timestamp (PST)"] = pd.to_datetime(df["Timestamp (PST)"])
+    df = df.sort_values(by="Timestamp (PST)", ascending=False)
+    df = df[~df["Mint"].isin(EXCLUDED_ADDRESSES)]
+    return df
+
+async def fetch_token_name(mint):
+    url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, timeout=3) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if "pairs" in data and data["pairs"]:
+                        return mint, data["pairs"][0]["baseToken"]["name"]
+        except:
+            return mint, "Unknown"
+    return mint, "Unknown"
+
+async def batch_fetch_token_names(mints):
+    tasks = [fetch_token_name(mint) for mint in mints]
+    return await asyncio.gather(*tasks)
+
+@st.cache_data(ttl=600)
+def fetch_token_names_async(df):
+    unique_mints = df["Mint"].dropna().unique().tolist()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    token_data = loop.run_until_complete(batch_fetch_token_names(unique_mints))
+    token_dict = dict(token_data)
+    df["Token Name"] = df["Mint"].apply(lambda x: token_dict.get(x, "Unknown"))
+    return df
+
+def process_token_data(token_data):
+    """
+    Computes risk analysis & safety score for a given token's transaction data.
+    """
+    if token_data.empty:
+        return None
+
+    mint = token_data["Mint"].iloc[0]
+    token_name = token_data["Token Name"].iloc[0]
+
+    unique_holders = token_data["To Account"].nunique()
+    total_transfers = len(token_data)
+
+    # Risk calculations
+    ownership_risk = 100 * (1 / (1 + unique_holders)) if unique_holders else 100
+    transaction_concentration = total_transfers / (1 + unique_holders)
+    liquidity_risk = 100 * (1 / (1 + token_data[token_data["Type"] == "SWAP"]["From Account"].nunique()))
+    rug_risk_score = (ownership_risk * 0.4) + (liquidity_risk * 0.4) + (transaction_concentration * 0.2)
+
+    # Safety is inverse of rug risk
+    safety_score = max(0, 100 - rug_risk_score)
+
+    return {
+        "Mint": mint,
+        "Token Name": token_name,
+        "Safety Score": safety_score,
+        "Ownership Risk": ownership_risk,
+        "Liquidity Risk": liquidity_risk,
+        "Transaction Concentration": transaction_concentration,
+        "Jeet Risk Score": rug_risk_score,
+    }
+
+def explain_risk(risk_data):
+    """
+    Provides a simple risk breakdown explanation based on risk metrics.
+    """
+    explanation = "📊 Jeet Risk Breakdown\n\n"
+
+    # Ownership Risk
+    if risk_data["Ownership Risk"] > 80:
+        explanation += "🚨 Ownership Risk is HIGH! Only a few people hold this token. If they sell, the price could crash.\n\n"
+    elif risk_data["Ownership Risk"] > 50:
+        explanation += "⚠️ Ownership Risk is MEDIUM. A small group controls a significant portion of this token.\n\n"
+    else:
+        explanation += "✅ Ownership Risk is LOW. Many different people hold this token, which is safer.\n\n"
+
+    # Liquidity Risk
+    if risk_data["Liquidity Risk"] > 80:
+        explanation += "🚨 Liquidity Risk is HIGH! There's very little money backing this token. Selling may be difficult.\n\n"
+    elif risk_data["Liquidity Risk"] > 50:
+        explanation += "⚠️ Liquidity Risk is MEDIUM. Some liquidity is available, but caution is advised.\n\n"
+    else:
+        explanation += "✅ Liquidity Risk is LOW. The token has enough liquidity for smooth trading.\n\n"
+
+    # Trading Activity / Transaction Concentration
+    if risk_data["Transaction Concentration"] > 100:
+        explanation += "🚨 Suspicious Trading Detected! Most transactions come from a few wallets, suggesting fake volume.\n\n"
+    else:
+        explanation += "✅ Trading Activity Looks Normal. No signs of wash trading detected.\n\n"
+
+    # Rug Risk Score
+    if risk_data["Jeet Risk Score"] > 80:
+        explanation += "💀 High Rug Risk! This token has major red flags. Avoid it unless you're willing to take a huge risk.\n\n"
+    elif risk_data["Rug Risk Score"] > 50:
+        explanation += "⚠️ Moderate Rug Risk. Be cautious and do more research before investing.\n\n"
+    else:
+        explanation += "✅ Low Jeet Risk. No major red flags detected.\n\n"
+
+    return explanation
+
+st.title("🔰 Safety Score: Buy✅ or Avoid⚠️?")
+st.write("I analyze live crypto transactions and tell you **which coins are less risky to buy** and **which ones might jeet**. NOTE: I Do **NOT** Predict which coins will pump. Invest at your own Risk. NFA")
+
+latest_file, latest_timestamp = get_latest_file_info()
+df = load_parquet_from_s3(latest_file, latest_timestamp)
+if df is not None:
+    df = fetch_token_names_async(df)
+
+if df is not None and not df.empty:
+    st.dataframe(df.head(100)[["Mint", "Token Name", "Timestamp (PST)"]])
+
+    st.subheader("🚀 Low Risk Coins to Trade")
+    risk_scores = [process_token_data(df[df["Mint"] == mint]) for mint in df["Mint"].unique()]
+    risk_scores = [score for score in risk_scores if score is not None]
+    low_risk_df = pd.DataFrame(risk_scores).sort_values(by="Safety Score", ascending=False).head(10)
+    st.dataframe(low_risk_df[["Mint", "Token Name", "Safety Score"]])
+
+    selected_label = st.selectbox("Select a Token for Detailed Analysis:", low_risk_df["Token Name"] + " | " + low_risk_df["Mint"])
+    selected_mint = selected_label.split(" | ")[1]
+
+    mint_data = df[df["Mint"] == selected_mint]
+    result = process_token_data(mint_data)
+
+    if result:
+        st.json(result)
+        st.subheader("📊 Safety Rating Explained")
+        st.write(explain_risk(result))
+        trade_url = f"https://swap.pump.fun/?input=So11111111111111111111111111111111111111112&output={selected_mint}"
+        st.markdown(f"[🚀 **Trade {result['Token Name']} on PumpSwap**]({trade_url})", unsafe_allow_html=True)
+
+refresh_rate = st.sidebar.slider("Set refresh rate (seconds)", 10, 600, 60)
+time.sleep(refresh_rate)
+st.rerun()

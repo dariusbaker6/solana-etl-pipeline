@@ -10,12 +10,12 @@
 
 ### 1. `my_websocket.py` – Extract
 - Listens to real-time WebSocket data (token launches/liquidity events)
-- Enriches and stores raw JSON to `s3://<your-bucket>/raw/`
+- Enriches and stores raw JSON to `s3://<s3-bucket>/raw/`
 - **[API keys redacted]**
 
 ### 1a. `cleandata1.py` – Initial Transform
 - Extracts mint address, token name, ticker, and launch marketcap
-- Outputs CSV format to `s3://<your-bucket>/clean/cleandata1/`
+- Outputs CSV format to `s3://<s3-bucket>/clean/cleandata1/`
 
 ### 2. `helius.py` – Batch Extract + Trigger
 - Pulls on-chain tx data for known mints via Helius API
@@ -25,7 +25,7 @@
 
 ### 3. `clean_data.py` + `csv_to_parquet.py` – Transform & Load
 - Cleans/normalizes fields, converts timestamps, removes dups
-- Outputs Parquet to `s3://<your-bucket>/structured/parquet/` (Athena-ready)
+- Outputs Parquet to `s3://<s3-bucket>/structured/parquet/` (Athena-ready)
 
 ### 4. Streamlit Dashboard – Analytics Layer
 - Consumes final dataset
